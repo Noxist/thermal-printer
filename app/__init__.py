@@ -1,9 +1,12 @@
 # app/__init__.py
 from fastapi import FastAPI
 from .config import setup_cors
-from .api import router as api_router
+
+# Router erst NACH dem App-Objekt importieren vermeidet Zirkularimporte
 from .ui import router as ui_router
 from .guests import router as guests_router
+from .api import router as api_router
+
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Printer API")
