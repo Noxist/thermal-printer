@@ -192,6 +192,8 @@ def ui_logout():
     r = RedirectResponse("/ui", status_code=303)
     r.delete_cookie(COOKIE_NAME, path="/")
     return r
+@router.get("/ui/settings", response_class=HTMLResponse)
+def ui_settings(request: Request): ...
 
 def ui_handle_auth_and_cookie(request: Request, pass_: str | None, remember: bool) -> tuple[bool, bool]:
     authed, should_set_cookie = ui_auth_state(request, pass_, remember)
