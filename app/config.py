@@ -1,142 +1,199 @@
-import os, json
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from PIL import ImageFont
+# app/guests.py
+from fastapi import APIRouter, Request, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse
+from PIL import Image
+import io
 
-# ---- Globale App-Einstellungen ----
-APP_API_KEY = os.getenv("API_KEY", "change_me")
-MQTT_HOST   = os.getenv("MQTT_HOST")
-MQTT_PORT   = int(os.getenv("MQTT_PORT", "8883"))
-MQTT_USER   = os.getenv("MQTT_USERNAME")
-MQTT_PASS   = os.getenv("MQTT_PASSWORD")
-MQTT_TLS    = os.getenv("MQTT_TLS", "true").lower() == "true"
-TOPIC       = os.getenv("PRINT_TOPIC", "print/tickets")
-PUBLISH_QOS = int(os.getenv("PRINT_QOS", "2"))
+from .config import GUEST_DB_FILE, PRINT_WIDTH_PX, ReceiptCfg, now_str
+from .render import render_receipt, render_image_with_headers, pil_to_base64_png
+from .security import require_ui_auth
+from .mqtt_client import mqtt_publish_image_base64
+from .guest_tokens import GuestDB
+from .ui import html_page, HTML_UI  # Reuse Layout/HTML
 
-UI_PASS = os.getenv("UI_PASS", "set_me")
-COOKIE_NAME = "ui_token"
-UI_REMEMBER_DAYS = int(os.getenv("UI_REMEMBER_DAYS", "30"))
-TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Zurich"))
+GUESTS = GuestDB(GUEST_DB_FILE)
+router = APIRouter()
 
-PRINT_WIDTH_PX = int(os.getenv("PRINT_WIDTH_PX", "576"))
-SETTINGS_FILE  = os.getenv("SETTINGS_FILE", "settings.json")
-GUEST_DB_FILE  = os.getenv("GUEST_DB_FILE", "guest_tokens.json")
 
-def now_str(fmt="%d.%m.%Y %H:%M") -> str:
-    return datetime.now(TZ).strftime(fmt)
+def guest_ui_html(token: str, name: str, remaining: int) -> str:
+    # HTML_UI wiederverwenden, aber ohne Passwortfelder und mit umgebogenen Routen
+    content = f"<div class='card'>Gast: <b>{name}</b> · heute übrig: {remaining}</div>" + HTML_UI
+    content = content.replace("{{AUTH_REQUIRED}}", "false")
+    content = content.replace('/ui/print/template', f'/guest/{token}/print/template')
+    content = content.replace('/ui/print/raw', f'/guest/{token}/print/raw')
+    content = content.replace('/ui/print/image', f'/guest/{token}/print/image')
+    return content
 
-# ---- settings.json + ENV overlay ----
-def _load_settings() -> dict:
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
 
-def _save_settings(data: dict):
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SETTINGS_FILE)
+@router.get("/guest/{token}", response_class=HTMLResponse)
+def guest_ui(token: str, request: Request):
+    info = GUESTS.validate(token)
+    if not info:
+        return html_page("Gast", "<div class='card'>Ungültiger oder deaktivierter Link.</div>")
+    remaining = GUESTS.remaining_today(token)
+    return html_page("Gastdruck", guest_ui_html(token, info["name"], remaining))
 
-SETTINGS = _load_settings()
 
-def cfg_get(name: str, default=None):
-    if name in SETTINGS:
-        return SETTINGS[name]
-    return os.getenv(name, default)
+def _guest_consume_or_error(token: str) -> dict | None:
+    # Zieht 1 aus dem Tageskontingent ab; None => Limit/ungültig
+    return GUESTS.consume(token)
 
-def cfg_get_int(name: str, default: int) -> int:
-    try: return int(cfg_get(name, default))
-    except: return default
 
-def cfg_get_float(name: str, default: float) -> float:
-    try: return float(cfg_get(name, default))
-    except: return default
-
-def cfg_get_bool(name: str, default: bool) -> bool:
-    v = str(cfg_get(name, default)).lower()
-    return v in ("1","true","yes","on","y","t")
-
-# ---- ReceiptCfg ----
-class ReceiptCfg:
-    def __init__(self):
-        self.preset = str(cfg_get("RECEIPT_PRESET", "clean")).lower()
-
-        self.title_size = 36
-        self.text_size  = 28
-        self.time_size  = 24
-
-        self.title_font_name = cfg_get("RECEIPT_TITLE_FONT", "DejaVuSans.ttf")
-        self.text_font_name  = cfg_get("RECEIPT_TEXT_FONT",  "DejaVuSans.ttf")
-        self.time_font_name  = cfg_get("RECEIPT_TIME_FONT",  "DejaVuSans.ttf")
-
-        self.margin_top    = 28
-        self.margin_bottom = 18
-        self.margin_left   = 18
-        self.margin_right  = 18
-
-        self.gap_title_text   = 10
-        self.line_height_mult = 1.15
-
-        self.align_title = cfg_get("RECEIPT_ALIGN_TITLE", "left")
-        self.align_text  = cfg_get("RECEIPT_ALIGN_TEXT",  "left")
-        self.align_time  = cfg_get("RECEIPT_ALIGN_TIME",  "left")
-
-        self.time_show_minutes = cfg_get_bool("RECEIPT_TIME_SHOW_MINUTES", True)
-        self.time_show_seconds = cfg_get_bool("RECEIPT_TIME_SHOW_SECONDS", False)
-        self.time_prefix       = cfg_get("RECEIPT_TIME_PREFIX", "")
-
-        self.rule_after_title  = cfg_get_bool("RECEIPT_RULE_AFTER_TITLE", False)
-        self.rule_px           = cfg_get_int("RECEIPT_RULE_PX", 1)
-        self.rule_pad          = cfg_get_int("RECEIPT_RULE_PAD", 6)
-
-        if self.preset == "compact":
-            self.title_size, self.text_size, self.time_size = 30, 24, 22
-            self.margin_top, self.margin_bottom = 16, 12
-            self.gap_title_text = 6
-            self.line_height_mult = 1.05
-        elif self.preset == "bigtitle":
-            self.title_size = 44
-            self.gap_title_text = 14
-            self.rule_after_title = True
-
-        self.title_size = cfg_get_int("RECEIPT_TITLE_SIZE", self.title_size)
-        self.text_size  = cfg_get_int("RECEIPT_TEXT_SIZE",  self.text_size)
-        self.time_size  = cfg_get_int("RECEIPT_TIME_SIZE",  self.time_size)
-
-        self.margin_top    = cfg_get_int("RECEIPT_MARGIN_TOP",    self.margin_top)
-        self.margin_bottom = cfg_get_int("RECEIPT_MARGIN_BOTTOM", self.margin_bottom)
-        self.margin_left   = cfg_get_int("RECEIPT_MARGIN_LEFT",   self.margin_left)
-        self.margin_right  = cfg_get_int("RECEIPT_MARGIN_RIGHT",  self.margin_right)
-
-        self.gap_title_text   = cfg_get_int("RECEIPT_GAP_TITLE_TEXT", self.gap_title_text)
-        self.line_height_mult = cfg_get_float("RECEIPT_LINE_HEIGHT",   self.line_height_mult)
-
-        self.font_title = _safe_font(self.title_font_name, self.title_size)
-        self.font_text  = _safe_font(self.text_font_name,  self.text_size)
-        self.font_time  = _safe_font(self.time_font_name,  self.time_size)
-
-def _safe_font(path_or_name: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(path_or_name, size=size)
-    except:
-        for cand in ("DejaVuSans.ttf", "Arial.ttf"):
-            try: return ImageFont.truetype(cand, size=size)
-            except: pass
-    return ImageFont.load_default()
-
-# --- CORS Setup --------------------------------------------------------------
-from fastapi.middleware.cors import CORSMiddleware
-
-def setup_cors(app):
-    """
-    Hängt ein offenes CORS-Middleware an (für interne Tools/UI völlig ok).
-    Wenn du Domains einschränken willst, passe allow_origins an.
-    """
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],     # oder z.B. ["https://deine-domain.tld"]
-        allow_methods=["*"],
-        allow_headers=["*"],
+@router.post("/guest/{token}/print/template")
+async def guest_print_template(
+    token: str,
+    title: str = Form("TASKS"),
+    lines: str = Form(""),
+    add_dt: bool = Form(False),
+):
+    tok = _guest_consume_or_error(token)
+    if not tok:
+        return html_page("Gastdruck", "<div class='card'>Limit erreicht oder Link ungültig.</div>")
+    cfg = ReceiptCfg()
+    img = render_receipt(
+        title.strip(),
+        [ln.rstrip() for ln in lines.splitlines()],
+        add_time=add_dt,
+        width_px=PRINT_WIDTH_PX,
+        cfg=cfg,
+        sender_name=tok["name"],
     )
+    b64 = pil_to_base64_png(img)
+    mqtt_publish_image_base64(b64, cut_paper=1)
+    return RedirectResponse(f"/guest/{token}#tpl", status_code=303)
+
+
+@router.post("/guest/{token}/print/raw")
+async def guest_print_raw(
+    token: str,
+    text: str = Form(""),
+    add_dt: bool = Form(False),
+):
+    tok = _guest_consume_or_error(token)
+    if not tok:
+        return html_page("Gastdruck", "<div class='card'>Limit erreicht oder Link ungültig.</div>")
+    cfg = ReceiptCfg()
+    lines = (text + (f"\n{now_str('%Y-%m-%d %H:%M')}" if add_dt else "")).splitlines()
+    img = render_receipt(
+        "",
+        lines,
+        add_time=False,
+        width_px=PRINT_WIDTH_PX,
+        cfg=cfg,
+        sender_name=tok["name"],
+    )
+    b64 = pil_to_base64_png(img)
+    mqtt_publish_image_base64(b64, cut_paper=1)
+    return RedirectResponse(f"/guest/{token}#raw", status_code=303)
+
+
+@router.post("/guest/{token}/print/image")
+async def guest_print_image(
+    token: str,
+    file: UploadFile = File(...),
+    img_title: str | None = Form(None),
+    img_subtitle: str | None = Form(None),
+):
+    tok = _guest_consume_or_error(token)
+    if not tok:
+        return html_page("Gastdruck", "<div class='card'>Limit erreicht oder Link ungültig.</div>")
+
+    content = await file.read()
+    src = Image.open(io.BytesIO(content))
+    cfg = ReceiptCfg()
+
+    # Titel/Untertitel + Senderzeile oberhalb des Bildes rendern
+    composed = render_image_with_headers(
+        src,
+        PRINT_WIDTH_PX,
+        cfg,
+        title=(img_title or ""),
+        subtitle=(img_subtitle or ""),
+        sender_name=tok["name"],
+    )
+    b64 = pil_to_base64_png(composed)
+    mqtt_publish_image_base64(b64, cut_paper=1)
+    return RedirectResponse(f"/guest/{token}#img", status_code=303)
+
+
+# ---------------- Admin-UI für Gäste ----------------
+
+@router.get("/ui/guests", response_class=HTMLResponse)
+def ui_guests(request: Request):
+    if not require_ui_auth(request):
+        return html_page("Gäste", "<div class='card'>Nicht angemeldet.</div>")
+
+    form = """
+    <section class="card">
+      <h3 class="title">Neuen Gast-Link erstellen</h3>
+      <form method="post" action="/ui/guests/create">
+        <div class="grid">
+          <div><label>Anzeige-Name auf dem Zettel</label><input type="text" name="name" value="" placeholder="z. B. Familie Müller" required></div>
+          <div><label>Quota pro Tag</label><input type="number" name="quota" value="5" min="1" max="50" step="1"></div>
+        </div>
+        <div class="row" style="margin-top:12px; gap:12px"><button type="submit">Erstellen</button></div>
+      </form>
+    </section>
+    """
+
+    lst_rows = []
+    for tok, info in GUESTS.list():
+        rem = GUESTS.remaining_today(tok)
+        link = f"/guest/{tok}"
+        state = "aktiv" if info.get("active") else "inaktiv"
+        lst_rows.append(
+            f"<tr style='border-top:1px solid var(--line)'>"
+            f"<td style='padding:8px'>{info.get('name','')}</td>"
+            f"<td style='padding:8px'>{info.get('quota_per_day',5)}</td>"
+            f"<td style='padding:8px'>{rem}</td>"
+            f"<td style='padding:8px'>{state}</td>"
+            f"<td style='padding:8px'><a class='link' href='{link}' target='_blank'>Link öffnen</a></td>"
+            f"<td style='padding:8px'>"
+            f"<form method='post' action='/ui/guests/revoke' style='display:inline'>"
+            f"<input type='hidden' name='token' value='{tok}'>"
+            f"<button class='secondary' type='submit'>Widerrufen</button>"
+            f"</form></td></tr>"
+        )
+
+    table = (
+        "<section class='card'><h3 class='title'>Bestehende Links</h3>"
+        "<table style='width:100%; border-collapse:collapse'>"
+        "<thead><tr>"
+        "<th style='text-align:left;padding:8px'>Name</th>"
+        "<th style='text-align:left;padding:8px'>Quota/Tag</th>"
+        "<th style='text-align:left;padding:8px'>Heute übrig</th>"
+        "<th style='text-align:left;padding:8px'>Status</th>"
+        "<th style='text-align:left;padding:8px'>Link</th>"
+        "<th style='text-align:left;padding:8px'></th>"
+        "</tr></thead><tbody>"
+        + "".join(lst_rows)
+        + "</tbody></table></section>"
+    )
+
+    return html_page("Gäste", form + table)
+
+
+@router.post("/ui/guests/create", response_class=HTMLResponse)
+async def ui_guests_create(request: Request):
+    if not require_ui_auth(request):
+        return html_page("Gäste", "<div class='card'>Nicht angemeldet.</div>")
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    quota = int((form.get("quota") or "5").strip())
+    token = GUESTS.create(name=name, quota_per_day=quota)
+    link = f"/guest/{token}"
+    return html_page(
+        "Gäste",
+        f"<section class='card'>Link erstellt: <a class='link' href='{link}' target='_blank'>{link}</a></section>"
+        f"<meta http-equiv='refresh' content='1;url=/ui/guests'>",
+    )
+
+
+@router.post("/ui/guests/revoke", response_class=HTMLResponse)
+async def ui_guests_revoke(request: Request):
+    if not require_ui_auth(request):
+        return html_page("Gäste", "<div class='card'>Nicht angemeldet.</div>")
+    form = await request.form()
+    tok = form.get("token") or ""
+    GUESTS.revoke(tok)
+    return RedirectResponse("/ui/guests", status_code=303)
