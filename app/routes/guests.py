@@ -1,3 +1,4 @@
+from guest_tokens import GuestDB
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from ..config import GUEST_DB_FILE, PRINT_WIDTH_PX, ReceiptCfg, now_str
