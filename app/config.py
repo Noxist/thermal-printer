@@ -125,3 +125,18 @@ def _safe_font(path_or_name: str, size: int) -> ImageFont.FreeTypeFont:
             try: return ImageFont.truetype(cand, size=size)
             except: pass
     return ImageFont.load_default()
+
+# --- CORS Setup --------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+def setup_cors(app):
+    """
+    Hängt ein offenes CORS-Middleware an (für interne Tools/UI völlig ok).
+    Wenn du Domains einschränken willst, passe allow_origins an.
+    """
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],     # oder z.B. ["https://deine-domain.tld"]
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
