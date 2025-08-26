@@ -1,9 +1,9 @@
 # app/ui.py
-from fastapi import APIRouter, Request, Form
+from fastapi import APIRouter, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .config import PRINT_WIDTH_PX, UI_PASS, require_ui_auth, issue_cookie
-from .config import ReceiptCfg, now_str
+from .config import PRINT_WIDTH_PX, UI_PASS, ReceiptCfg, now_str
+from .security import require_ui_auth, issue_cookie
 from .render import render_receipt, render_image_with_headers, pil_to_base64_png
 from .mqtt_client import mqtt_publish_image_base64
 
@@ -217,14 +217,12 @@ def html_page_ui(auth_required: bool) -> HTMLResponse:
 
 @router.get("/ui", response_class=HTMLResponse)
 def ui(request: Request):
-    from .config import require_ui_auth
     auth_required = not require_ui_auth(request) and bool(UI_PASS)
-    return html_page_ui(not not auth_required)
+    return html_page_ui(bool(auth_required))
 
 
 @router.get("/ui/logout")
 def ui_logout():
-    from fastapi import Response
     from .config import COOKIE_NAME
     r = RedirectResponse("/ui", status_code=303)
     r.delete_cookie(COOKIE_NAME, path="/")
@@ -299,9 +297,8 @@ async def ui_print_image(
     content = await file.read()
     src = Image.open(io.BytesIO(content))
     cfg = ReceiptCfg()
-    from .render import render_image_with_headers
     composed = render_image_with_headers(src, PRINT_WIDTH_PX, cfg,
-                                         title=img_title or "", subtitle=img_subtitle or "")
+                                         title=(img_title or ""), subtitle=(img_subtitle or ""))
     b64 = pil_to_base64_png(composed)
     mqtt_publish_image_base64(b64, cut_paper=1)
     resp = RedirectResponse("/ui#img", status_code=303)
