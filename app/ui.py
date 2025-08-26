@@ -1,15 +1,11 @@
 # app/ui.py
-from fastapi import APIRouter, Request, UploadFile, File, Form
+from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from ..config import (
-    PRINT_WIDTH_PX, ReceiptCfg, now_str, COOKIE_NAME,
-    SETTINGS, _save_settings, cfg_get
-)
-from ..render import render_receipt, render_image_with_headers, pil_to_base64_png
-from ..security import ui_auth_state, require_ui_auth, issue_cookie
-from ..mqtt_client import mqtt_publish_image_base64
-from PIL import Image
-import io
+
+from .config import PRINT_WIDTH_PX, UI_PASS, require_ui_auth, issue_cookie
+from .config import ReceiptCfg, now_str
+from .render import render_receipt, render_image_with_headers, pil_to_base64_png
+from .mqtt_client import mqtt_publish_image_base64
 
 router = APIRouter()
 
