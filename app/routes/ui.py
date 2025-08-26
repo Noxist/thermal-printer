@@ -1,6 +1,10 @@
+# app/ui.py
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from ..config import PRINT_WIDTH_PX, ReceiptCfg, now_str, COOKIE_NAME
+from ..config import (
+    PRINT_WIDTH_PX, ReceiptCfg, now_str, COOKIE_NAME,
+    SETTINGS, _save_settings, cfg_get
+)
 from ..render import render_receipt, render_image_with_headers, pil_to_base64_png
 from ..security import ui_auth_state, require_ui_auth, issue_cookie
 from ..mqtt_client import mqtt_publish_image_base64
@@ -9,6 +13,7 @@ import io
 
 router = APIRouter()
 
+# ---------- Layout ----------
 HTML_BASE = r"""
 <!doctype html><html lang="de"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -58,7 +63,7 @@ HTML_BASE = r"""
   <div class="title">Quittungsdruck</div><div class="spacer"></div>
   <nav class="nav">
     <a class="link" href="/ui">Drucken</a>
-    <a class="link" href="/ui/guests">Gäste</a>
+    <a class="link" href="/ui/guests">Gaeste</a>
     <a class="link" href="/ui/settings">Einstellungen</a>
     <a class="link" href="/ui/logout" title="Logout">Logout</a>
   </nav>
@@ -70,6 +75,7 @@ HTML_BASE = r"""
 def html_page(title: str, content: str) -> HTMLResponse:
     return HTMLResponse(HTML_BASE.replace("{title}", title).replace("{content}", content))
 
+# ---------- Haupt-UI ----------
 HTML_UI = r"""
 <div class="tabs" role="tablist" aria-label="Modus">
   <div class="tab" role="tab" id="tab-tpl" aria-controls="pane_tpl" aria-selected="true" tabindex="0">Vorlage</div>
@@ -90,11 +96,11 @@ HTML_UI = r"""
       </div>
     </div>
     <div class="row" style="margin-top:12px">
-      <label><input type="checkbox" name="add_dt" checked> Datum/Zeit automatisch anhängen</label>
+      <label><input type="checkbox" name="add_dt" checked> Datum/Zeit automatisch anhaengen</label>
       <div class="grow"></div>
       <div id="auth-wrap" class="row" style="gap:10px">
         <label for="pass">UI-Passwort</label>
-        <input id="pass" type="password" name="pass" placeholder="nur falls nötig" style="max-width:220px">
+        <input id="pass" type="password" name="pass" placeholder="nur falls noetig" style="max-width:220px">
         <label id="remember-wrap"><input type="checkbox" name="remember"> Angemeldet bleiben</label>
       </div>
     </div>
@@ -109,11 +115,11 @@ HTML_UI = r"""
     <label for="text">Freitext</label>
     <textarea id="text" name="text" placeholder="Kurzer Zettel …"></textarea>
     <div class="row" style="margin-top:12px">
-      <label><input type="checkbox" name="add_dt"> Datum/Zeit anhängen</label>
+      <label><input type="checkbox" name="add_dt"> Datum/Zeit anhaengen</label>
       <div class="grow"></div>
       <div id="auth-wrap2" class="row" style="gap:10px">
         <label for="pass2">UI-Passwort</label>
-        <input id="pass2" type="password" name="pass" placeholder="nur falls nötig" style="max-width:220px">
+        <input id="pass2" type="password" name="pass" placeholder="nur falls noetig" style="max-width:220px">
         <label id="remember-wrap2"><input type="checkbox" name="remember"> Angemeldet bleiben</label>
       </div>
     </div>
@@ -132,13 +138,13 @@ HTML_UI = r"""
       </div>
       <div>
         <label for="img_title">Titel (optional)</label>
-        <input id="img_title" type="text" name="img_title" placeholder="Titel über dem Bild">
+        <input id="img_title" type="text" name="img_title" placeholder="Titel ueber dem Bild">
       </div>
     </div>
     <div class="grid" style="margin-top:8px">
       <div>
         <label for="img_subtitle">Untertitel (optional)</label>
-        <input id="img_subtitle" type="text" name="img_subtitle" placeholder="Untertitel über dem Bild">
+        <input id="img_subtitle" type="text" name="img_subtitle" placeholder="Untertitel ueber dem Bild">
       </div>
     </div>
     <div class="row" style="margin-top:12px">
@@ -146,7 +152,7 @@ HTML_UI = r"""
       <div class="grow"></div>
       <div id="auth-wrap3" class="row" style="gap:10px">
         <label for="pass3">UI-Passwort</label>
-        <input id="pass3" type="password" name="pass" placeholder="nur falls nötig" style="max-width:220px">
+        <input id="pass3" type="password" name="pass" placeholder="nur falls noetig" style="max-width:220px">
         <label id="remember-wrap3"><input type="checkbox" name="remember"> Angemeldet bleiben</label>
       </div>
     </div>
@@ -179,6 +185,9 @@ const AUTH_REQUIRED=String("{{AUTH_REQUIRED}}").toLowerCase().trim()==="true";
 </script>
 """.replace("{w}", str(PRINT_WIDTH_PX))
 
+def html(title: str, content: str) -> HTMLResponse:
+    return html_page(title, content)
+
 def page_ui(auth_required_flag: str) -> HTMLResponse:
     return html_page("Quittungsdruck", HTML_UI.replace("{{AUTH_REQUIRED}}", auth_required_flag))
 
@@ -192,8 +201,120 @@ def ui_logout():
     r = RedirectResponse("/ui", status_code=303)
     r.delete_cookie(COOKIE_NAME, path="/")
     return r
+
+# ---------- Settings-UI ----------
+# Form-Felder (ENV-Overrides werden respektiert)
+SET_KEYS = [
+    ("RECEIPT_PRESET", "clean", "select", ["clean","compact","bigtitle"]),
+    ("RECEIPT_MARGIN_TOP", 28, "number", None),
+    ("RECEIPT_MARGIN_BOTTOM", 18, "number", None),
+    ("RECEIPT_MARGIN_LEFT", 18, "number", None),
+    ("RECEIPT_MARGIN_RIGHT", 18, "number", None),
+    ("RECEIPT_GAP_TITLE_TEXT", 10, "number", None),
+    ("RECEIPT_LINE_HEIGHT", 1.15, "number", None),
+    ("RECEIPT_RULE_AFTER_TITLE", False, "checkbox", None),
+    ("RECEIPT_RULE_PX", 1, "number", None),
+    ("RECEIPT_RULE_PAD", 6, "number", None),
+
+    ("RECEIPT_ALIGN_TITLE", "left", "select", ["left","center","right"]),
+    ("RECEIPT_ALIGN_TEXT", "left", "select", ["left","center","right"]),
+    ("RECEIPT_ALIGN_TIME", "left", "select", ["left","center","right"]),
+
+    ("RECEIPT_TITLE_SIZE", 36, "number", None),
+    ("RECEIPT_TEXT_SIZE", 28, "number", None),
+    ("RECEIPT_TIME_SIZE", 24, "number", None),
+    ("RECEIPT_TITLE_FONT", "DejaVuSans.ttf", "text", None),
+    ("RECEIPT_TEXT_FONT", "DejaVuSans.ttf", "text", None),
+    ("RECEIPT_TIME_FONT", "DejaVuSans.ttf", "text", None),
+
+    ("RECEIPT_TIME_SHOW_MINUTES", True, "checkbox", None),
+    ("RECEIPT_TIME_SHOW_SECONDS", False, "checkbox", None),
+    ("RECEIPT_TIME_PREFIX", "", "text", None),
+]
+
+def _settings_effective() -> dict:
+    eff = {}
+    for key, default, _, _opts in SET_KEYS:
+        eff[key] = cfg_get(key, default)
+    return eff
+
+def _settings_form_html() -> str:
+    eff = _settings_effective()
+    rows = []
+    for key, default, typ, opts in SET_KEYS:
+        val = eff.get(key, default)
+        label = key.replace("RECEIPT_", "").replace("_", " ").title()
+        if typ == "select":
+            options = "".join([f'<option value="{o}"{" selected" if str(val)==str(o) else ""}>{o}</option>' for o in opts])
+            field = f'<select name="{key}">{options}</select>'
+        elif typ == "checkbox":
+            checked = " checked" if str(val).lower() in ("1","true","yes","on","y","t") else ""
+            field = f'<input type="checkbox" name="{key}" value="1"{checked}>'
+        elif typ == "number":
+            field = f'<input type="number" step="any" name="{key}" value="{val}">'
+        else:
+            field = f'<input type="text" name="{key}" value="{val}">'
+        rows.append(f"<div><label>{label}</label>{field}</div>")
+    form = f"""
+    <section class="card">
+      <form method="post" action="/ui/settings/save">
+        <div class="grid">
+          {''.join(rows)}
+        </div>
+        <div class="row" style="margin-top:12px; gap:12px">
+          <button type="submit">Speichern</button>
+          <a class="link" href="/ui/settings/test">Testdruck</a>
+        </div>
+      </form>
+    </section>
+    """
+    return form
+
 @router.get("/ui/settings", response_class=HTMLResponse)
-def ui_settings(request: Request): ...
+def ui_settings(request: Request):
+    if not require_ui_auth(request):
+        return html("Einstellungen", "<div class='card'>Nicht angemeldet.</div>")
+    content = "<h3 class='title'>Einstellungen</h3>" + _settings_form_html()
+    return html("Einstellungen", content)
+
+@router.post("/ui/settings/save", response_class=HTMLResponse)
+async def ui_settings_save(request: Request):
+    if not require_ui_auth(request):
+        return html("Einstellungen", "<div class='card'>Nicht angemeldet.</div>")
+    form = await request.form()
+    # in SETTINGS schreiben (persistiert via _save_settings)
+    for key, default, typ, _ in SET_KEYS:
+        if typ == "checkbox":
+            SETTINGS[key] = True if form.get(key) else False
+        else:
+            val = form.get(key)
+            if val is None:
+                SETTINGS[key] = default
+            else:
+                if typ == "number":
+                    try:
+                        SETTINGS[key] = int(val) if "." not in val else float(val)
+                    except:
+                        SETTINGS[key] = default
+                else:
+                    SETTINGS[key] = val
+    _save_settings(SETTINGS)
+    return RedirectResponse("/ui/settings", status_code=303)
+
+@router.get("/ui/settings/test", response_class=HTMLResponse)
+def ui_settings_test(request: Request):
+    if not require_ui_auth(request):
+        return html("Einstellungen", "<div class='card'>Nicht angemeldet.</div>")
+    cfg = ReceiptCfg()
+    sample_lines = ["Wasser trinken", "Schriftstelle lesen", "Sport – 20 Min"]
+    img = render_receipt("TEST", sample_lines, add_time=True, width_px=PRINT_WIDTH_PX, cfg=cfg)
+    b64 = pil_to_base64_png(img)
+    mqtt_publish_image_base64(b64, cut_paper=1)
+    return html("Einstellungen", "<div class='card'>Testdruck gesendet.</div>")
+
+# ---------- Drucken ----------
+def page_ui_flag(request: Request) -> str:
+    return "false" if require_ui_auth(request) else "true"
 
 def ui_handle_auth_and_cookie(request: Request, pass_: str | None, remember: bool) -> tuple[bool, bool]:
     authed, should_set_cookie = ui_auth_state(request, pass_, remember)
@@ -213,7 +334,8 @@ async def ui_print_template(
     if not authed:
         return html_page("Quittungsdruck", "<div class='card'>Falsches Passwort.</div>")
     cfg = ReceiptCfg()
-    img = render_receipt(title.strip(), [ln.rstrip() for ln in lines.splitlines()], add_time=add_dt, width_px=PRINT_WIDTH_PX, cfg=cfg)
+    img = render_receipt(title.strip(), [ln.rstrip() for ln in lines.splitlines()],
+                         add_time=add_dt, width_px=PRINT_WIDTH_PX, cfg=cfg)
     b64 = pil_to_base64_png(img); mqtt_publish_image_base64(b64, cut_paper=1)
     resp = RedirectResponse("/ui#tpl", status_code=303)
     if set_cookie: issue_cookie(resp)
